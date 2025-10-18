@@ -1,0 +1,45 @@
+version: "3.8"
+
+services:
+  hggd:
+    image: hggd_humble:latest          
+    container_name: hggd_humble
+
+    tty: true
+    stdin_open: true
+
+    # ----- GPU pass-through (Compose v3) -----
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+    ipc: host
+    shm_size: "2g"
+    network_mode: host
+
+    environment:
+      - LANG=en_US.UTF-8
+      - LC_ALL=en_US.UTF-8
+      - ROS_DISTRO=humble
+      - ROS_DOMAIN_ID=42
+      - RMW_IMPLEMENTATION=rmw_fastrtps_cpp
+      - DISPLAY=${DISPLAY}
+      - QT_X11_NO_MITSHM=1
+      - NVIDIA_VISIBLE_DEVICES=all
+      - NVIDIA_DRIVER_CAPABILITIES=all
+      - MPLBACKEND=Agg
+      - QT_QPA_PLATFORM=offscreen
+
+    volumes:
+      # your editable repo (host) → workspace inside the container
+      - /home/iki/kortex_sim/src/hggd_ros2:/ros2_ws/src/hggd_ros2
+      # X11 socket for Open3D / RViz
+      - /tmp/.X11-unix:/tmp/.X11-unix:rw
+
+    # keep the container running so you can `docker exec -it hggd bash`
+    command: >
+      bash -lc "tail -f /dev/null"

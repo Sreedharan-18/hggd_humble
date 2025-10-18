@@ -1,0 +1,7 @@
+# request (none)
+---
+geometry_msgs/PoseStamped grasp_pose
+float32 score
+bool    success
+string  message
+
