@@ -1,9 +1,27 @@
 #!/usr/bin/env python3
-import os
-import sys
-import random
+"""
+RGB-D -> HGGD one-shot runner (no services, no MoveIt).
+- Subscribes to RGB, depth, CameraInfo once (via cv_bridge)
+- Runs HGGD on the captured pair (same pipeline as demo/service)
+- Prints JSON with top-K grasps to stdout
+- Publishes RViz axes markers on /hggd_grasps_markers
+- Exits
+
+Usage (example):
+  ros2 run grasp_pose_detection rgbd_hggd_one_shot \
+    --ros-args \
+      -p hggd_root:=/ros2_ws/src/hggd_ros2/HGGD \
+      -p checkpoint_path:=/ros2_ws/src/hggd_ros2/HGGD/realsense_checkpoint \
+      -p rgb_topic:=/wrist_mounted_camera/image \
+      -p depth_topic:=/wrist_mounted_camera/depth_image \
+      -p camera_info_topic:=/wrist_mounted_camera/camera_info \
+      -p input_h:=384 -p input_w:=640
+"""
+
+from __future__ import annotations
+import os, sys, json, math, time
 from pathlib import Path
-from typing import Dict, List
+from typing import Optional, Tuple, List
 
 import numpy as np
 import torch
@@ -11,637 +29,376 @@ import torch.nn.functional as F
 
 import rclpy
 from rclpy.node import Node
-from rclpy.qos import (
-    QoSProfile,
-    QoSReliabilityPolicy,
-    QoSDurabilityPolicy,
-    QoSHistoryPolicy,
-)
-
-from sensor_msgs.msg import Image as ROSImage
+from rclpy.qos import QoSProfile, QoSReliabilityPolicy, QoSDurabilityPolicy, QoSHistoryPolicy
+from std_msgs.msg import Header
+from builtin_interfaces.msg import Duration
+from geometry_msgs.msg import Point, Vector3
+from visualization_msgs.msg import Marker, MarkerArray
+from sensor_msgs.msg import Image as ROSImage, CameraInfo
 from cv_bridge import CvBridge
 
-from std_srvs.srv import Trigger
-from builtin_interfaces.msg import Duration
-from geometry_msgs.msg import PoseStamped
-from moveit_msgs.msg import Grasp, GripperTranslation
-from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
-
-
-def _resolve_hggd_root():
-    env = os.environ.get("HGGD_ROOT", None)
-    candidates = []
-    if env:
-        candidates.append(Path(env))
-    candidates.append(Path("/workspace/HGGD/src/HGGD"))          # common mount
+# ─────────────────── HGGD path resolution ───────────────────
+def _resolve_hggd_root(env_name="HGGD_ROOT") -> Optional[str]:
+    env = os.environ.get(env_name)
     here = Path(__file__).resolve()
-    candidates.append(here.parents[2] / "HGGD")                  # …/src/HGGD
-    candidates.append(here.parents[1] / "HGGD")                  # …/pkg/HGGD
-
-    for c in candidates:
-        if c and c.exists() and (c / "dataset").is_dir() and (c / "models").is_dir():
-            return str(c)
+    cands = [env] if env else []
+    cands += [
+        here.parents[2] / "HGGD",             # …/src/HGGD
+        here.parents[1] / "HGGD",
+        "/ros2_ws/src/hggd_ros2/HGGD",
+        "/workspace/HGGD/src/HGGD",
+    ]
+    for p in cands:
+        p = Path(p) if p else None
+        if p and (p / "dataset").is_dir() and (p / "models").is_dir():
+            return str(p)
     return None
 
-_hggd_guess = _resolve_hggd_root()
-if _hggd_guess and _hggd_guess not in sys.path:
-    sys.path.insert(0, _hggd_guess)
+_hggd = _resolve_hggd_root()
+if _hggd and _hggd not in sys.path:
+    sys.path.insert(0, _hggd)
 
-# ------------------------------------------------------------------------------
-# HGGD imports (must succeed)
-# ------------------------------------------------------------------------------
+# ─────────────────── HGGD imports ───────────────────
 from dataset.config import get_camera_intrinsic
 from dataset.evaluation import (
-    anchor_output_process,
-    collision_detect,
-    detect_2d_grasp,
-    detect_6d_grasp_multi,
+    anchor_output_process, detect_2d_grasp, detect_6d_grasp_multi, collision_detect
 )
 from dataset.pc_dataset_tools import data_process, feature_fusion
 from models.anchornet import AnchorGraspNet
 from models.localgraspnet import PointMultiGraspNet
-from train_utils import *  # noqa: F401,F403 (for logging used by HGGD)
 
-# ------------------------------------------------------------------------------
-# Helpers (same math as in your file-based service)
-# ------------------------------------------------------------------------------
+# ─────────────────── helpers ───────────────────
+def _pad_even_every_level(x: torch.Tensor, depth: int = 5):
+    """Pad bottom/right so all encoder intermediate sizes remain EVEN."""
+    _, _, H, W = x.shape
+
+    def need_pad(dim: int) -> int:
+        pad = 0
+        while True:
+            d = dim + pad
+            ok = True
+            for _ in range(depth - 1):
+                d = (d - 4) // 2
+                if d % 2:
+                    ok = False
+                    break
+            if ok:
+                return pad
+            pad += 1
+
+    ph, pw = need_pad(H), need_pad(W)
+    if ph or pw:
+        x = F.pad(x, (0, pw, 0, ph))
+    return x, ph, pw
+
 def build_T_mats_from_graspgroup(gg):
-    # Compose SE(3) from rotations & translations
-    if hasattr(gg, 'rotation_matrices'):
-        R = gg.rotation_matrices
-    elif hasattr(gg, 'rotations'):
-        R = gg.rotations
-    else:
-        raise AttributeError("GraspGroup missing rotations")
-    if hasattr(gg, 'translations'):
-        t = gg.translations
-    elif hasattr(gg, 'translation'):
-        t = gg.translation
-    else:
-        raise AttributeError("GraspGroup missing translations")
-
-    R = np.asarray(R)
-    t = np.asarray(t)
-    N = R.shape[0]
-    T = np.tile(np.eye(4, dtype=R.dtype)[None, ...], (N, 1, 1))
+    R = np.asarray(getattr(gg, "rotation_matrices", getattr(gg, "rotations")))
+    t = np.asarray(getattr(gg, "translations", getattr(gg, "translation")))
+    T = np.tile(np.eye(4, dtype=R.dtype)[None], (R.shape[0], 1, 1))
     T[:, :3, :3] = R
     T[:, :3, 3] = t
     return T
 
 def rotmat_to_quat_xyzw(R):
-    R = np.asarray(R, dtype=np.float64)
-    tr = np.trace(R)
+    R = np.asarray(R, dtype=np.float64); tr = np.trace(R)
     if tr > 0.0:
-        s = np.sqrt(tr + 1.0) * 2.0
+        s = math.sqrt(tr + 1.0) * 2.0
         qw = 0.25 * s
-        qx = (R[2, 1] - R[1, 2]) / s
-        qy = (R[0, 2] - R[2, 0]) / s
-        qz = (R[1, 0] - R[0, 1]) / s
+        qx, qy, qz = (R[2,1]-R[1,2])/s, (R[0,2]-R[2,0])/s, (R[1,0]-R[0,1])/s
     else:
-        if (R[0, 0] > R[1, 1]) and (R[0, 0] > R[2, 2]):
-            s = np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2]) * 2.0
-            qw = (R[2, 1] - R[1, 2]) / s
-            qx = 0.25 * s
-            qy = (R[0, 1] + R[1, 0]) / s
-            qz = (R[0, 2] + R[2, 0]) / s
-        elif R[1, 1] > R[2, 2]:
-            s = np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2]) * 2.0
-            qw = (R[0, 2] - R[2, 0]) / s
-            qx = (R[0, 1] + R[1, 0]) / s
-            qy = 0.25 * s
-            qz = (R[1, 2] + R[2, 1]) / s
+        if (R[0,0] > R[1,1]) and (R[0,0] > R[2,2]):
+            s = math.sqrt(1.0 + R[0,0] - R[1,1] - R[2,2]) * 2.0
+            qw = (R[2,1]-R[1,2])/s; qx = 0.25*s
+            qy, qz = (R[0,1]+R[1,0])/s, (R[0,2]+R[2,0])/s
+        elif R[1,1] > R[2,2]:
+            s = math.sqrt(1.0 + R[1,1] - R[0,0] - R[2,2]) * 2.0
+            qw = (R[0,2]-R[2,0])/s; qy = 0.25*s
+            qx, qz = (R[0,1]+R[1,0])/s, (R[1,2]+R[2,1])/s
         else:
-            s = np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1]) * 2.0
-            qw = (R[1, 0] - R[0, 1]) / s
-            qx = (R[0, 2] + R[2, 0]) / s
-            qy = (R[1, 2] + R[2, 1]) / s
-            qz = 0.25 * s
+            s = math.sqrt(1.0 + R[2,2] - R[0,0] - R[1,1]) * 2.0
+            qw = (R[1,0]-R[0,1])/s; qz = 0.25*s
+            qx, qy = (R[0,2]+R[2,0])/s, (R[1,2]+R[2,1])/s
     return float(qx), float(qy), float(qz), float(qw)
 
-class PointCloudHelper:
-    """
-    Converts RGB-D to:
-      - sampled point cloud with (xyz [+ rgb]) features
-      - downsampled xyz maps for feature fusion
-    Assumes 1280x720 intrinsics by default (HGGD realsense config).
-    """
-    def __init__(self, all_points_num) -> None:
-        self.all_points_num = all_points_num
-        self.output_shape = (80, 45)  # (W, H) for downsampled xyzs
-        intrinsics = get_camera_intrinsic()
-        fx, fy = intrinsics[0, 0], intrinsics[1, 1]
-        cx, cy = intrinsics[0, 2], intrinsics[1, 2]
-        # full-res maps (assumes 1280x720)
-        ymap, xmap = np.meshgrid(np.arange(720), np.arange(1280))
-        points_x = (xmap - cx) / fx
-        points_y = (ymap - cy) / fy
-        self.points_x = torch.from_numpy(points_x).float()
-        self.points_y = torch.from_numpy(points_y).float()
-        # downscaled maps for xyz fusion
-        ymap, xmap = np.meshgrid(np.arange(self.output_shape[1]),
-                                 np.arange(self.output_shape[0]))
-        factor = 1280 / self.output_shape[0]
-        points_x = (xmap - cx / factor) / (fx / factor)
-        points_y = (ymap - cy / factor) / (fy / factor)
-        self.points_x_downscale = torch.from_numpy(points_x).float()
-        self.points_y_downscale = torch.from_numpy(points_y).float()
+class DynamicPointCloudHelper:
+    """Build sampled XYZRGB and downsampled xyz maps from RGB-D + intrinsics."""
+    def __init__(self, N: int):
+        self.N = N
+        self.points_x = self.points_y = None
+        self.points_xd = self.points_yd = None
+        self.out_shape = (45, 80)  # (H,W)
 
-    def to_scene_points(self, rgbs: torch.Tensor, depths: torch.Tensor, include_rgb=True):
-        batch_size = rgbs.shape[0]
-        feature_len = 3 + 3 * include_rgb
-        points_all = -torch.ones(
-            (batch_size, self.all_points_num, feature_len),
-            dtype=torch.float32).cuda()
-        masks = (depths > 0)
-        cur_zs = depths / 1000.0
-        cur_xs = self.points_x.cuda() * cur_zs
-        cur_ys = self.points_y.cuda() * cur_zs
-        for i in range(batch_size):
-            points = torch.stack([cur_xs[i], cur_ys[i], cur_zs[i]], axis=-1)
-            mask = masks[i]
-            points = points[mask]
-            colors = rgbs[i][:, mask].T
-            if len(points) >= self.all_points_num:
-                idxs = random.sample(range(len(points)), self.all_points_num)
-                points = points[idxs]
-                colors = colors[idxs]
-            if include_rgb:
-                points_all[i] = torch.concat([points, colors], axis=1)
-            else:
-                points_all[i] = points
-        return points_all
+    def set_intrinsics(self, K: np.ndarray, w: int, h: int):
+        fx, fy, cx, cy = K[0,0], K[1,1], K[0,2], K[1,2]
+        ys, xs = np.meshgrid(np.arange(h), np.arange(w), indexing="ij")
+        self.points_x = torch.from_numpy((xs - cx)/fx).float()
+        self.points_y = torch.from_numpy((ys - cy)/fy).float()
+        Hd, Wd = self.out_shape
+        ys_d, xs_d = np.meshgrid(np.arange(Hd), np.arange(Wd), indexing="ij")
+        fx_d, fy_d, cx_d, cy_d = fx/w*Wd, fy/h*Hd, cx/w*Wd, cy/h*Hd
+        self.points_xd = torch.from_numpy((xs_d - cx_d)/fx_d).float()
+        self.points_yd = torch.from_numpy((ys_d - cy_d)/fy_d).float()
 
-    def to_xyz_maps(self, depths):
-        downsample_depths = F.interpolate(depths[:, None],
-                                          size=self.output_shape,
-                                          mode='nearest').squeeze(1).cuda()
-        cur_zs = downsample_depths / 1000.0
-        cur_xs = self.points_x_downscale.cuda() * cur_zs
-        cur_ys = self.points_y_downscale.cuda() * cur_zs
-        xyzs = torch.stack([cur_xs, cur_ys, cur_zs], axis=-1)
-        return xyzs.permute(0, 3, 1, 2)
+    def ready(self): return self.points_x is not None
 
-# ------------------------------------------------------------------------------
-# ROS2 Node
-# ------------------------------------------------------------------------------
-class GraspPoseServicePerObject(Node):
+    def to_scene_points(self, rgb: torch.Tensor, d_mm: torch.Tensor):
+        B = rgb.shape[0]
+        out = -torch.ones((B, self.N, 6), device=rgb.device)
+        z = d_mm/1000.0; mask = d_mm > 0
+        x = self.points_x.to(z.device)*z; y = self.points_y.to(z.device)*z
+        for i in range(B):
+            pts = torch.stack([x[i],y[i],z[i]], -1)[mask[i]]
+            cols = rgb[i].permute(1,2,0).reshape(-1,3)[mask[i].reshape(-1)]
+            if len(pts) >= self.N:
+                idx = torch.randperm(len(pts), device=pts.device)[:self.N]
+                pts, cols = pts[idx], cols[idx]
+            out[i, :len(pts)] = torch.cat([pts, cols], 1)
+        return out
+
+    def to_xyz_maps(self, d_mm: torch.Tensor):
+        Hd, Wd = self.out_shape
+        z = F.interpolate(d_mm[:,None], (Hd,Wd), mode="nearest").squeeze(1)/1000.0
+        x = self.points_xd.to(z.device)*z; y = self.points_yd.to(z.device)*z
+        return torch.stack([x,y,z], 1)
+
+# ─────────────────── Node ───────────────────
+class OneShotHGGD(Node):
     def __init__(self):
-        super().__init__('grasp_pose_service_topics_per_object')
+        super().__init__("rgbd_hggd_one_shot")
         self.bridge = CvBridge()
-        self.last_rgb_np = None
-        self.last_depth_np = None
+        self.rgb = None      # np.ndarray HxWx3 (uint8)
+        self.dmm = None      # np.ndarray HxW (float32 mm)
+        self.K = get_camera_intrinsic()
+        self.rgb_size = None
+        self.cam_frame = None
+        self.got_all = False
 
-        # ---------- Parameters ----------
-        # Where HGGD lives (if you need to override)
-        self.declare_parameter('hggd_root', '')
-        # Camera topics
-        self.declare_parameter('rgb_topic', '/camera/color/image_raw')
-        self.declare_parameter('depth_topic', '/camera/depth/image_raw')
-        # Frame for published poses
-        self.declare_parameter('frame_id', 'camera_color_optical_frame')
+        # Params
+        self.declare_parameter("hggd_root", "")
+        self.declare_parameter("checkpoint_path", "./realsense_checkpoint")
+        self.declare_parameter("rgb_topic", "/wrist_mounted_camera/image")
+        self.declare_parameter("depth_topic", "/wrist_mounted_camera/depth_image")
+        self.declare_parameter("camera_info_topic", "/wrist_mounted_camera/camera_info")
+        self.declare_parameter("frame_id", "")
+        self.declare_parameter("input_h", 384)
+        self.declare_parameter("input_w", 640)
+        self.declare_parameter("topk", 10)
+        self.declare_parameter("viz_enable", True)
+        self.declare_parameter("viz_axis_len", 0.08)
+        self.declare_parameter("viz_axis_diam", 0.01)
+        # HGGD hyper-params needed
+        for n, v in [("sigma",10),("ratio",8),("anchor_k",6),("anchor_w",50.0),("anchor_z",20.0),
+                     ("grid_size",8),("anchor_num",7),("all_points_num",25600),("center_num",48),
+                     ("group_num",512),("heatmap_thres",0.01),("local_k",10),("local_thres",0.01),
+                     ("rotation_num",1)]:
+            self.declare_parameter(n, v)
 
-        # Model/data params (matching your CLI)
-        self.declare_parameter('checkpoint_path', './realsense_checkpoint')
-        self.declare_parameter('input_h', 360)
-        self.declare_parameter('input_w', 640)
-        self.declare_parameter('sigma', 10)
-        self.declare_parameter('ratio', 8)
-        self.declare_parameter('anchor_k', 6)
-        self.declare_parameter('anchor_w', 50.0)
-        self.declare_parameter('anchor_z', 20.0)
-        self.declare_parameter('grid_size', 8)
+        # Make HGGD root effective if user provided it here
+        hroot = self.get_parameter("hggd_root").get_parameter_value().string_value
+        if hroot and hroot not in sys.path:
+            sys.path.insert(0, hroot); os.environ["HGGD_ROOT"] = hroot
+        self.get_logger().info(f"HGGD_ROOT = {os.environ.get('HGGD_ROOT','?')}")
 
-        self.declare_parameter('anchor_num', 7)
-        self.declare_parameter('all_points_num', 25600)
-        self.declare_parameter('center_num', 48)
-        self.declare_parameter('group_num', 512)
-
-        self.declare_parameter('heatmap_thres', 0.01)
-        self.declare_parameter('local_k', 10)
-        self.declare_parameter('local_thres', 0.01)
-        self.declare_parameter('rotation_num', 1)
-
-        # Selection
-        self.declare_parameter('topk_per_object', 2)
-
-        # Publisher behavior
-        self.declare_parameter('latched', True)
-        self.declare_parameter('repeat_hz', 0.0)  # optional, republish last
-
-        # Gripper mapping (width[m] -> joints)
-        self.declare_parameter('gripper.max_width_m', 0.10)
-        self.declare_parameter('gripper.open_pos', 0.00)
-        self.declare_parameter('gripper.closed_pos', 0.80)
-        self.declare_parameter('gripper.joint_names', ['gripper_left_joint', 'gripper_right_joint'])
-        self.declare_parameter('approach_min_dist', 0.05)
-        self.declare_parameter('approach_desired', 0.10)
-        self.declare_parameter('retreat_min_dist', 0.05)
-        self.declare_parameter('retreat_desired', 0.10)
-
-        # Ensure HGGD path if provided
-        hggd_root = self.get_parameter('hggd_root').get_parameter_value().string_value
-        if hggd_root:
-            if hggd_root not in sys.path:
-                sys.path.insert(0, hggd_root)
-            os.environ['HGGD_ROOT'] = hggd_root
-            self.get_logger().info(f'Using hggd_root: {hggd_root}')
-        elif _hggd_guess:
-            self.get_logger().info(f'Using hggd_root guess: {_hggd_guess}')
-        else:
-            self.get_logger().warn('HGGD root not resolved—set param hggd_root or env HGGD_ROOT.')
-
-        # ---------- Subscribers ----------
-        rgb_topic = self.get_parameter('rgb_topic').get_parameter_value().string_value
-        depth_topic = self.get_parameter('depth_topic').get_parameter_value().string_value
-
-        # Best-effort for camera topics is typical; use reliable if your driver supports
-        sub_qos = QoSProfile(
+        # QoS matching camera streams
+        qos = QoSProfile(
             reliability=QoSReliabilityPolicy.BEST_EFFORT,
             durability=QoSDurabilityPolicy.VOLATILE,
-            depth=1,
-            history=QoSHistoryPolicy.KEEP_LAST,
+            depth=1, history=QoSHistoryPolicy.KEEP_LAST
         )
-        self.create_subscription(ROSImage, rgb_topic, self._rgb_cb, sub_qos)
-        self.create_subscription(ROSImage, depth_topic, self._depth_cb, sub_qos)
 
-        # ---------- Publishers ----------
-        # One latched publisher per object ID (created on demand)
-        self._obj_publishers: Dict[int, rclpy.publisher.Publisher] = {}
+        # Subscriptions
+        self.create_subscription(ROSImage, self.get_parameter("rgb_topic").value, self._cb_rgb, qos)
+        self.create_subscription(ROSImage, self.get_parameter("depth_topic").value, self._cb_d, qos)
+        self.create_subscription(CameraInfo, self.get_parameter("camera_info_topic").value, self._cb_ci, qos)
 
-        # Optional combined stream (all objects)
-        self._pub_all = self._make_publisher('top_grasps_all')
+        # Markers
+        self.viz_pub = self.create_publisher(MarkerArray, "hggd_grasps_markers", 10)
+        self.marker_id = 0
 
-        # Cache last per-object msgs if you want to republish
-        self._last_msgs: Dict[int, List[Grasp]] = {}
+        # Load models
+        self._load_models()
 
-        # Optional periodic republish
-        rep_hz = float(self.get_parameter('repeat_hz').get_parameter_value().double_value)
-        self._rep_timer = None
-        if rep_hz > 0.0:
-            self._rep_timer = self.create_timer(1.0 / rep_hz, self._republish_last)
+        # Timer to check readiness
+        self.timer = self.create_timer(0.1, self._maybe_run_once)
 
-        # ---------- Models ----------
-        self._init_models()
-        self.get_logger().info('GraspPose service (per-object) ready. Call: ros2 service call /get_top_grasps std_srvs/srv/Trigger {}')
+    # Callbacks
+    def _cb_ci(self, msg: CameraInfo):
+        self.K = np.array(msg.k, dtype=np.float32).reshape(3,3)
+        self.cam_frame = msg.header.frame_id
 
-        # ---------- Service ----------
-        self._srv = self.create_service(Trigger, 'get_top_grasps', self._handle_get_top_grasps)
+    def _cb_rgb(self, msg: ROSImage):
+        img = self.bridge.imgmsg_to_cv2(msg, "rgb8")
+        self.rgb = np.asarray(img)
+        self.rgb_size = (img.shape[1], img.shape[0])
 
-    # --------------------------------------------------------------------------
-    # Image callbacks
-    # --------------------------------------------------------------------------
-    def _rgb_cb(self, msg: ROSImage):
-        # Convert to RGB8 numpy
+    def _cb_d(self, msg: ROSImage):
+        d = self.bridge.imgmsg_to_cv2(msg, "passthrough")
+        if d.dtype in (np.float32, np.float64):
+            self.dmm = (d.astype(np.float32) * 1000.0)  # meters->mm
+        else:
+            self.dmm = d.astype(np.float32)
+
+    # Models
+    def _load_models(self):
+        P = lambda n: self.get_parameter(n).value
+        ckpt = torch.load(P("checkpoint_path"), map_location="cuda")
+        self.anchornet = AnchorGraspNet(in_dim=4, ratio=P("ratio"), anchor_k=P("anchor_k")).cuda().eval()
+        self.localnet  = PointMultiGraspNet(info_size=3, k_cls=P("anchor_num")**2).cuda().eval()
+        self.anchornet.load_state_dict(ckpt["anchor"])
+        self.localnet.load_state_dict(ckpt["local"])
+        basic = torch.linspace(-1,1,P("anchor_num")+1).cuda()
+        self.anchors = {"gamma":(basic[1:]+basic[:-1])/2, "beta":(basic[1:]+basic[:-1])/2}
+        if "gamma" in ckpt: self.anchors["gamma"] = ckpt["gamma"].to("cuda")
+        if "beta"  in ckpt: self.anchors["beta"]  = ckpt["beta"].to("cuda")
+        self.pc = DynamicPointCloudHelper(P("all_points_num"))
+
+    # One-shot driver
+    def _maybe_run_once(self):
+        if self.got_all:  # already ran
+            return
+        if self.rgb is None or self.dmm is None:
+            return
+        if self.K is None or self.rgb_size is None:
+            return
+
+        # lock & run
+        self.got_all = True
         try:
-            rgb = self.bridge.imgmsg_to_cv2(msg, desired_encoding='rgb8')
-            self.last_rgb_np = np.asarray(rgb)
-        except Exception as e:
-            self.get_logger().warn(f'RGB conversion error: {e}')
-
-    def _depth_cb(self, msg: ROSImage):
-        # Convert to np (passthrough keeps original encoding)
-        try:
-            depth = self.bridge.imgmsg_to_cv2(msg, desired_encoding='passthrough')
-            depth_np = np.asarray(depth)
-            # Normalize to millimeters like your original file pipeline
-            if depth_np.dtype == np.float32 or depth_np.dtype == np.float64:
-                # depth is likely in meters → convert to mm
-                depth_mm = (depth_np * 1000.0).astype(np.float32)
+            res = self._run_hggd_once()
+            if res is None:
+                print(json.dumps({"success": False, "message": "no_grasps"}))
             else:
-                # likely uint16 in mm already
-                depth_mm = depth_np.astype(np.float32)
-            # Clip to match original 0..1000mm constraint (adjust if needed)
-            depth_mm = np.clip(depth_mm, 0, 1000)
-            self.last_depth_np = depth_mm
+                print(json.dumps({"success": True, "grasps": res}, indent=2))
         except Exception as e:
-            self.get_logger().warn(f'Depth conversion error: {e}')
+            self.get_logger().error(f"one-shot failed: {e}")
+            print(json.dumps({"success": False, "message": f"{type(e).__name__}: {e}"}))
+        finally:
+            # give RViz a moment to receive markers, then exit
+            rclpy.task.Future()
+            self.destroy_timer(self.timer)
+            # shutdown from within the node
+            self.get_logger().info("Done. Shutting down.")
+            rclpy.shutdown()
 
-    # --------------------------------------------------------------------------
-    # Model init
-    # --------------------------------------------------------------------------
-    def _init_models(self):
-        P = lambda n: self.get_parameter(n).get_parameter_value()
-        cp = P('checkpoint_path').string_value
-        self.input_h = P('input_h').integer_value
-        self.input_w = P('input_w').integer_value
-        self.sigma = P('sigma').integer_value
-        self.ratio = P('ratio').integer_value
-        self.anchor_k = P('anchor_k').integer_value
-        self.anchor_w = P('anchor_w').double_value
-        self.anchor_z = P('anchor_z').double_value
-        self.grid_size = P('grid_size').integer_value
+    # Core inference
+    def _run_hggd_once(self):
+        P = lambda n: self.get_parameter(n).value
+        h, w = int(P("input_h")), int(P("input_w"))
 
-        self.anchor_num = P('anchor_num').integer_value
-        self.all_points_num = P('all_points_num').integer_value
-        self.center_num = P('center_num').integer_value
-        self.group_num = P('group_num').integer_value
+        # Intrinsics tied to the *actual* frame size
+        self.pc.set_intrinsics(self.K, self.rgb_size[0], self.rgb_size[1])
 
-        self.heatmap_thres = P('heatmap_thres').double_value
-        self.local_k = P('local_k').integer_value
-        self.local_thres = P('local_thres').double_value
-        self.rotation_num = P('rotation_num').integer_value
+        # tensors
+        rgb_t = torch.from_numpy((self.rgb/255.0).astype(np.float32)).permute(2,0,1)[None].cuda()
+        dmm_t = torch.from_numpy(self.dmm)[None].cuda()
 
-        self.topk_per_object = P('topk_per_object').integer_value
+        pts_all = self.pc.to_scene_points(rgb_t, dmm_t)
+        xyzs    = self.pc.to_xyz_maps(dmm_t)
 
-        # Torch
-        if not torch.cuda.is_available():
-            raise RuntimeError('CUDA not available')
-        np.set_printoptions(precision=4, suppress=True)
-        torch.set_printoptions(precision=4, sci_mode=False)
-        torch.backends.cudnn.enabled = True
-        torch.backends.cudnn.benchmark = False
-        random.seed(123); np.random.seed(123); torch.manual_seed(123)
+        # resize inputs for 2D stage
+        rgb_rs = F.interpolate(rgb_t, (h, w))
+        d_norm = F.interpolate((dmm_t/1000.0)[:,None], (h, w)).squeeze(1)
+        d_norm = torch.clip(d_norm - d_norm.mean(), -1, 1)
+        x = torch.cat([d_norm[:,None], rgb_rs], 1).to(dtype=torch.float32).cuda()
 
-        # Networks
-        self.anchornet = AnchorGraspNet(in_dim=4, ratio=self.ratio, anchor_k=self.anchor_k).cuda().eval()
-        self.localnet = PointMultiGraspNet(info_size=3, k_cls=self.anchor_num**2).cuda().eval()
-
-        # Load checkpoint & anchors
-        ckpt = torch.load(cp)
-        self.anchornet.load_state_dict(ckpt['anchor'])
-        self.localnet.load_state_dict(ckpt['local'])
-        basic_ranges = torch.linspace(-1, 1, self.anchor_num + 1).cuda()
-        basic_anchors = (basic_ranges[1:] + basic_ranges[:-1]) / 2
-        self.anchors = {'gamma': basic_anchors, 'beta': basic_anchors}
-        if 'gamma' in ckpt and 'beta' in ckpt:
-            self.anchors['gamma'] = ckpt['gamma']
-            self.anchors['beta'] = ckpt['beta']
-            logging.info('Using saved anchors')
-        print(f'-> loaded checkpoint {cp}')
-
-        # Intrinsics
-        self.K = get_camera_intrinsic()
-
-    # --------------------------------------------------------------------------
-    # Inference using latest frames
-    # --------------------------------------------------------------------------
-    def _run_inference_from_latest(self):
-        if self.last_rgb_np is None or self.last_depth_np is None:
-            return None
-
-        # Convert to tensors like your file pipeline
-        ori_rgb = (self.last_rgb_np / 255.0).astype(np.float32)
-        ori_depth = self.last_depth_np.astype(np.float32)
-
-        # transpose to (B,C,W,H) with your original (permute 2,1,0) convention
-        ori_rgb_t = torch.from_numpy(ori_rgb).permute(2, 1, 0)[None].to('cuda', dtype=torch.float32)
-        ori_depth_t = torch.from_numpy(ori_depth).T[None].to('cuda', dtype=torch.float32)
-
-        # Pointcloud helper
-        pc_helper = PointCloudHelper(all_points_num=self.all_points_num)
-        view_points = pc_helper.to_scene_points(ori_rgb_t, ori_depth_t, include_rgb=True)
-        # to_scene_points returns only points_all here
-        points_all = view_points
-        xyzs = pc_helper.to_xyz_maps(ori_depth_t)
-
-        # Preprocess (note: original uses (input_w, input_h))
-        rgb = F.interpolate(ori_rgb_t, (self.input_w, self.input_h))
-        depth = F.interpolate(ori_depth_t[None], (self.input_w, self.input_h))[0] / 1000.0
-        depth = torch.clip((depth - depth.mean()), -1, 1)
-        x = torch.concat([depth[None], rgb], 1).to('cuda', dtype=torch.float32)
+        # robust pad (fix skip connections)
+        x, ph, pw = _pad_even_every_level(x, depth=5)
 
         with torch.no_grad():
-            # 2D stage
-            pred_2d, perpoint_features = self.anchornet(x)
-            loc_map, cls_mask, theta_offset, height_offset, width_offset = \
-                anchor_output_process(*pred_2d, sigma=self.sigma)
+            p2d, feat = self.anchornet(x)
+            if ph or pw:
+                p2d = [t[..., : -ph or None, : -pw or None] for t in p2d]
 
-            rect_gg = detect_2d_grasp(
-                loc_map, cls_mask, theta_offset, height_offset, width_offset,
-                ratio=self.ratio, anchor_k=self.anchor_k,
-                anchor_w=self.anchor_w, anchor_z=self.anchor_z,
-                mask_thre=self.heatmap_thres,
-                center_num=self.center_num, grid_size=self.grid_size,
-                grasp_nms=self.grid_size, reduce='max')
-
-            if rect_gg.size == 0:
-                self.get_logger().warn('No 2D grasps found')
+            loc_map, cls_mask, th_off, h_off, w_off = anchor_output_process(*p2d, sigma=P("sigma"))
+            rect = detect_2d_grasp(
+                loc_map, cls_mask, th_off, h_off, w_off,
+                ratio=P("ratio"), anchor_k=P("anchor_k"),
+                anchor_w=P("anchor_w"), anchor_z=P("anchor_z"),
+                mask_thre=P("heatmap_thres"),
+                center_num=P("center_num"), grid_size=P("grid_size"),
+                grasp_nms=P("grid_size"), reduce="max"
+            )
+            if rect.size == 0:
+                self.get_logger().warn("No 2D grasps found.")
                 return None
 
-            # Feature fusion (+ build local groups)
-            points_all = feature_fusion(points_all[..., :3], perpoint_features, xyzs)
-            rect_ggs = [rect_gg]
-            pc_group, valid_local_centers = data_process(
-                points_all, ori_depth_t, rect_ggs,
-                self.center_num, self.group_num,
-                (self.input_w, self.input_h),
-                min_points=32, is_training=False)
-            rect_gg = rect_ggs[0]
-            points_all = points_all.squeeze()
-
-            # conditioning info (theta, width, depth)
-            grasp_info = np.zeros((0, 3), dtype=np.float32)
-            g_thetas = rect_gg.thetas[None]
-            g_ws = rect_gg.widths[None]
-            g_ds = rect_gg.depths[None]
-            cur_info = np.vstack([g_thetas, g_ws, g_ds])
-            grasp_info = np.vstack([grasp_info, cur_info.T])
-            grasp_info = torch.from_numpy(grasp_info).to(dtype=torch.float32, device='cuda')
-
-            # 3D refinement
-            _, pred, offset = self.localnet(pc_group, grasp_info)
-            _, pred_rect_gg = detect_6d_grasp_multi(
-                rect_gg, pred, offset, valid_local_centers,
-                (self.input_w, self.input_h), self.anchors, k=self.local_k)
-
-            # Collision + NMS
-            pred_gg, _ = collision_detect(
-                points_all, pred_rect_gg.to_6d_grasp_group(depth=0.02),
-                mode='graspnet')
-            pred_gg = pred_gg.nms()
-
-            if len(pred_gg) == 0:
-                self.get_logger().warn('No valid 6D grasps after collision/NMS')
+            pts_all = feature_fusion(pts_all[...,:3], feat, xyzs)
+            pc_group, _ = data_process(
+                pts_all, dmm_t, [rect], P("center_num"), P("group_num"),
+                (w, h), min_points=32, is_training=False
+            )
+            gi = torch.from_numpy(np.vstack([rect.thetas, rect.widths, rect.depths]).T.astype(np.float32)).cuda()
+            _, pred, off = self.localnet(pc_group, gi)
+            _, rect6d = detect_6d_grasp_multi(rect, pred, off, None, (w, h), self.anchors, k=P("local_k"))
+            gg, _ = collision_detect(pts_all.squeeze(), rect6d.to_6d_grasp_group(depth=0.02), mode="graspnet")
+            gg = gg.nms()
+            if len(gg) == 0:
+                self.get_logger().warn("No valid 6D grasps after collision/NMS.")
                 return None
 
-            return pred_gg
+        # collect top-K (per object id)
+        T_all = build_T_mats_from_graspgroup(gg)
+        widths = np.asarray(getattr(gg,"widths",getattr(gg,"grasp_widths",np.full(len(gg),0.04))))
+        scores = np.asarray(getattr(gg,"scores", getattr(gg,"confidence", np.zeros(len(gg)))))
+        obj_ids = np.asarray(getattr(gg,"object_ids", np.zeros(len(gg), dtype=np.int32)))
+        topk = int(P("topk"))
 
-    # --------------------------------------------------------------------------
-    # Gripper / MoveIt conversion
-    # --------------------------------------------------------------------------
-    def _width_to_joint_positions(self, width_m: float):
-        P = lambda n: self.get_parameter(n).get_parameter_value()
-        max_w = P('gripper.max_width_m').double_value
-        open_pos = P('gripper.open_pos').double_value
-        closed_pos = P('gripper.closed_pos').double_value
-        joint_names = [s for s in P('gripper.joint_names').string_array_value]
-
-        r = float(np.clip(width_m / max_w, 0.0, 1.0))
-        pos = closed_pos + r * (open_pos - closed_pos)
-        if len(joint_names) <= 1:
-            return joint_names, [pos]
-        else:
-            return joint_names, [pos] * len(joint_names)
-
-    def _make_moveit_grasp(self, T_4x4: np.ndarray, width_m: float, score: float, idx: int) -> Grasp:
-        P = lambda n: self.get_parameter(n).get_parameter_value()
-        frame_id = P('frame_id').string_value
-
-        gpose = PoseStamped()
-        gpose.header.frame_id = frame_id
-        gpose.header.stamp = self.get_clock().now().to_msg()
-
-        R = T_4x4[:3, :3]; t = T_4x4[:3, 3]
-        qx, qy, qz, qw = rotmat_to_quat_xyzw(R)
-        gpose.pose.position.x = float(t[0])
-        gpose.pose.position.y = float(t[1])
-        gpose.pose.position.z = float(t[2])
-        gpose.pose.orientation.x = float(qx)
-        gpose.pose.orientation.y = float(qy)
-        gpose.pose.orientation.z = float(qz)
-        gpose.pose.orientation.w = float(qw)
-
-        joint_names, open_positions = self._width_to_joint_positions(P('gripper.max_width_m').double_value)
-        _, close_positions = self._width_to_joint_positions(0.0)
-
-        pre = JointTrajectory()
-        pre.joint_names = joint_names
-        pt_open = JointTrajectoryPoint()
-        pt_open.positions = open_positions
-        pt_open.time_from_start = Duration(sec=0, nanosec=500_000_000)
-        pre.points = [pt_open]
-
-        grasp_post = JointTrajectory()
-        grasp_post.joint_names = joint_names
-        pt_close = JointTrajectoryPoint()
-        pt_close.positions = close_positions
-        pt_close.time_from_start = Duration(sec=0, nanosec=700_000_000)
-        grasp_post.points = [pt_close]
-
-        z_axis = R[:, 2]
-        app = GripperTranslation()
-        app.direction.header.frame_id = frame_id
-        app.direction.vector.x = float(z_axis[0])
-        app.direction.vector.y = float(z_axis[1])
-        app.direction.vector.z = float(z_axis[2])
-        app.min_distance = P('approach_min_dist').double_value
-        app.desired_distance = P('approach_desired').double_value
-
-        ret = GripperTranslation()
-        ret.direction.header.frame_id = frame_id
-        ret.direction.vector.x = float(-z_axis[0])
-        ret.direction.vector.y = float(-z_axis[1])
-        ret.direction.vector.z = float(-z_axis[2])
-        ret.min_distance = P('retreat_min_dist').double_value
-        ret.desired_distance = P('retreat_desired').double_value
-
-        msg = Grasp()
-        msg.id = f'grasp_{idx}'
-        msg.grasp_pose = gpose
-        msg.grasp_quality = float(score)
-        msg.pre_grasp_posture = pre
-        msg.grasp_posture = grasp_post
-        msg.pre_grasp_approach = app
-        msg.post_grasp_retreat = ret
-        return msg
-
-    # --------------------------------------------------------------------------
-    # Service: compute & publish top-K per object
-    # --------------------------------------------------------------------------
-    def _handle_get_top_grasps(self, request, response):
-        pred_gg = self._run_inference_from_latest()
-        if pred_gg is None:
-            response.success = False
-            response.message = 'No grasps found (frames missing or detection failed).'
-            return response
-
-        # Extract arrays
-        T_all = build_T_mats_from_graspgroup(pred_gg)
-        widths = np.asarray(pred_gg.widths) if hasattr(pred_gg, 'widths') else np.asarray(pred_gg.grasp_widths)
-        scores = np.asarray(pred_gg.scores) if hasattr(pred_gg, 'scores') else (
-            np.asarray(pred_gg.confidences) if hasattr(pred_gg, 'confidences') else np.asarray(pred_gg.confidence)
-        )
-        if hasattr(pred_gg, 'object_ids') and pred_gg.object_ids is not None:
-            obj_ids = np.asarray(pred_gg.object_ids)
-        else:
-            # if not provided, assign everything to object 0
-            obj_ids = np.zeros(len(scores), dtype=np.int32)
-
-        unique_ids = np.unique(obj_ids)
-        k = self.topk_per_object
-
-        # Reset last cache
-        self._last_msgs.clear()
-
-        total_published = 0
-        for oid in unique_ids:
+        out = []
+        for oid in np.unique(obj_ids):
             sel = np.where(obj_ids == oid)[0]
-            if sel.size == 0:
-                continue
-            order = sel[np.argsort(-scores[sel])]
-            keep = order[:min(k, len(order))]
+            keep = sel[np.argsort(-scores[sel])][:min(topk, len(sel))]
+            for idx in keep:
+                T = T_all[idx]; R = T[:3,:3]; t = T[:3,3]
+                qx,qy,qz,qw = rotmat_to_quat_xyzw(R)
+                out.append(dict(
+                    object_id=int(oid),
+                    score=float(scores[idx]),
+                    width_m=float(widths[idx]),
+                    position_xyz=[float(v) for v in t],
+                    orientation_xyzw=[qx,qy,qz,qw]
+                ))
 
-            self.get_logger().info(f'Object {int(oid)}: publishing top-{len(keep)} grasps')
-            pub = self._get_obj_publisher(int(oid))  # latched per object
-            msgs_for_obj: List[Grasp] = []
+        # RViz markers
+        self._publish_markers(T_all, count=len(out))
+        return out
 
-            for rank, idx in enumerate(keep, start=1):
-                T = T_all[idx]
-                w = float(widths[idx])
-                s = float(scores[idx])
-                t = T[:3, 3]
-                self.get_logger().info(
-                    f'  #{rank}: score={s:.4f} center=[{t[0]:.4f}, {t[1]:.4f}, {t[2]:.4f}] width={w:.4f} (object_id={int(oid)})'
-                )
-                msg = self._make_moveit_grasp(T, w, s, idx)
-                # Make ID include object id for clarity
-                msg.id = f'obj{int(oid)}_grasp_{rank-1}'
-                pub.publish(msg)
-                self._pub_all.publish(msg)
-                msgs_for_obj.append(msg)
-                total_published += 1
+    def _publish_markers(self, T_all: np.ndarray, count: int):
+        if not self.get_parameter("viz_enable").value or count == 0:
+            return
+        L = float(self.get_parameter("viz_axis_len").value)
+        D = float(self.get_parameter("viz_axis_diam").value)
+        frame = self.get_parameter("frame_id").value or self.cam_frame or "camera_color_optical_frame"
+        colors = [(1,0,0,1),(0,1,0,1),(0,0,1,1)]
+        ma = MarkerArray(); now = self.get_clock().now().to_msg()
+        for i in range(count):
+            T = T_all[i]; R, t = T[:3,:3], T[:3,3]
+            origin = Point(x=float(t[0]), y=float(t[1]), z=float(t[2]))
+            for a, ax in enumerate(R.T):
+                tip = Point(x=float(t[0]+L*ax[0]), y=float(t[1]+L*ax[1]), z=float(t[2]+L*ax[2]))
+                m = Marker()
+                m.header = Header(frame_id=frame, stamp=now)
+                m.ns = "grasp_axes"; m.id = self.marker_id
+                m.type = Marker.ARROW; m.action = Marker.ADD
+                m.lifetime = Duration(sec=0, nanosec=800_000_000)
+                m.scale = Vector3(x=D, y=D*2, z=D*2)
+                m.points = [origin, tip]
+                r,g,b,a = colors[a]
+                m.color.r, m.color.g, m.color.b, m.color.a = r,g,b,a
+                ma.markers.append(m); self.marker_id += 1
+        self.viz_pub.publish(ma)
 
-            self._last_msgs[int(oid)] = msgs_for_obj
-
-        response.success = total_published > 0
-        response.message = f'Published {total_published} grasps across {len(unique_ids)} objects.'
-        return response
-
-    # --------------------------------------------------------------------------
-    # QoS / Publishers
-    # --------------------------------------------------------------------------
-    def _make_publisher(self, name: str):
-        latched = self.get_parameter('latched').get_parameter_value().bool_value
-        if latched:
-            qos = QoSProfile(
-                reliability=QoSReliabilityPolicy.RELIABLE,
-                durability=QoSDurabilityPolicy.TRANSIENT_LOCAL,  # latch latest
-                depth=10,
-                history=QoSHistoryPolicy.KEEP_LAST,
-            )
-        else:
-            qos = QoSProfile(
-                reliability=QoSReliabilityPolicy.RELIABLE,
-                durability=QoSDurabilityPolicy.VOLATILE,
-                depth=10,
-                history=QoSHistoryPolicy.KEEP_LAST,
-            )
-        return self.create_publisher(Grasp, name, qos)
-
-    def _get_obj_publisher(self, oid: int):
-        if oid not in self._obj_publishers:
-            topic = f'top_grasps/object_{oid}'
-            self._obj_publishers[oid] = self._make_publisher(topic)
-        return self._obj_publishers[oid]
-
-    def _republish_last(self):
-        # Optional periodic re-publish so late subscribers get the latest
-        for oid, msgs in self._last_msgs.items():
-            pub = self._get_obj_publisher(oid)
-            for m in msgs:
-                pub.publish(m)
-                self._pub_all.publish(m)
-
-
+# ─────────────────── main ───────────────────
 def main():
     rclpy.init()
-    node = GraspPoseServicePerObject()
+    node = OneShotHGGD()
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
-    node.destroy_node()
-    rclpy.shutdown()
+    # if we got here without node->shutdown, do it now
+    if rclpy.ok():
+        node.destroy_node()
+        rclpy.shutdown()
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()

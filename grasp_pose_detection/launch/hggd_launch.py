@@ -7,11 +7,12 @@ from launch_ros.actions import Node
 
 def generate_launch_description():
     # Defaults; override on CLI only if needed
-    hggd_root         = DeclareLaunchArgument('hggd_root',            default_value='/workspace/HGGD/src/HGGD')
-    checkpoint_path   = DeclareLaunchArgument('checkpoint_path',      default_value='/workspace/HGGD/src/HGGD/realsense_checkpoint')
-    rgb_topic         = DeclareLaunchArgument('rgb_topic',            default_value='/camera/color/image_raw')
-    depth_topic       = DeclareLaunchArgument('depth_topic',          default_value='/camera/depth/image_raw')
-    frame_id          = DeclareLaunchArgument('frame_id',             default_value='camera_color_optical_frame')
+    hggd_root         = DeclareLaunchArgument('hggd_root',            default_value='/ros2_ws/src/hggd_ros2/HGGD')
+    checkpoint_path   = DeclareLaunchArgument('checkpoint_path',      default_value='/ros2_ws/src/hggd_ros2/HGGD/realsense_checkpoint')
+    rgb_topic         = DeclareLaunchArgument('rgb_topic',            default_value='/wrist_mounted_camera/image')
+    depth_topic       = DeclareLaunchArgument('depth_topic',          default_value='/wrist_mounted_camera/depth_image')
+    camera_info_topic = DeclareLaunchArgument('camera_info_topic',    default_value='/wrist_mounted_camera/camera_info')
+    frame_id          = DeclareLaunchArgument('frame_id',             default_value='color_optical_frame')
 
     input_h           = DeclareLaunchArgument('input_h',              default_value='360')
     input_w           = DeclareLaunchArgument('input_w',              default_value='640')
@@ -28,6 +29,10 @@ def generate_launch_description():
     latched           = DeclareLaunchArgument('latched',              default_value='true')
     repeat_hz         = DeclareLaunchArgument('repeat_hz',            default_value='0.0')
 
+    viz_enable        = DeclareLaunchArgument('viz_enable',           default_value='true')
+    viz_axis_len      = DeclareLaunchArgument('viz_axis_len',         default_value='0.08')
+    viz_axis_diam     = DeclareLaunchArgument('viz_axis_diam',        default_value='0.01')
+
     gripper_joint_names = DeclareLaunchArgument('gripper.joint_names', default_value='[gripper_left_joint,gripper_right_joint]')
     gripper_max_width   = DeclareLaunchArgument('gripper.max_width_m', default_value='0.10')
     gripper_open_pos    = DeclareLaunchArgument('gripper.open_pos',    default_value='0.0')
@@ -40,7 +45,7 @@ def generate_launch_description():
 
     node = Node(
         package='grasp_pose_detection',
-        executable='hggd_grasp_service',   # <-- must match setup.py console_scripts
+        executable='hggd_grasp_service',   # console_scripts entry points to grasp_pose_service:main
         name='grasp_pose_service_topics_per_object',
         output='screen',
         parameters=[{
@@ -48,6 +53,7 @@ def generate_launch_description():
             'checkpoint_path':       LaunchConfiguration('checkpoint_path'),
             'rgb_topic':             LaunchConfiguration('rgb_topic'),
             'depth_topic':           LaunchConfiguration('depth_topic'),
+            'camera_info_topic':     LaunchConfiguration('camera_info_topic'),
             'frame_id':              LaunchConfiguration('frame_id'),
             'input_h':               LaunchConfiguration('input_h'),
             'input_w':               LaunchConfiguration('input_w'),
@@ -62,6 +68,9 @@ def generate_launch_description():
             'topk_per_object':       LaunchConfiguration('topk_per_object'),
             'latched':               LaunchConfiguration('latched'),
             'repeat_hz':             LaunchConfiguration('repeat_hz'),
+            'viz_enable':            LaunchConfiguration('viz_enable'),
+            'viz_axis_len':          LaunchConfiguration('viz_axis_len'),
+            'viz_axis_diam':         LaunchConfiguration('viz_axis_diam'),
             'gripper.joint_names':   LaunchConfiguration('gripper.joint_names'),
             'gripper.max_width_m':   LaunchConfiguration('gripper.max_width_m'),
             'gripper.open_pos':      LaunchConfiguration('gripper.open_pos'),
@@ -74,10 +83,11 @@ def generate_launch_description():
     )
 
     return LaunchDescription([
-        hggd_root, checkpoint_path, rgb_topic, depth_topic, frame_id,
+        hggd_root, checkpoint_path, rgb_topic, depth_topic, camera_info_topic, frame_id,
         input_h, input_w, anchor_num, all_points_num, center_num, group_num,
         local_k, ratio, local_thres, heatmap_thres, topk_per_object,
         latched, repeat_hz,
+        viz_enable, viz_axis_len, viz_axis_diam,
         gripper_joint_names, gripper_max_width, gripper_open_pos, gripper_closed_pos,
         approach_min_dist, approach_desired, retreat_min_dist, retreat_desired,
         node
